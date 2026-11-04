@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,14 +17,43 @@ import (
 	"gorm.io/gorm"
 )
 
-// ErrNotInternal 账号未通过院内身份校验（UniSSO internal 非 true）。
-var ErrNotInternal = errors.New("该账号没有图床访问权限，仅限软件工程学院内部账号使用")
+var (
+	// ErrNotInternal 账号未通过院内身份校验（UniSSO internal 非 true）。
+	ErrNotInternal = errors.New("该账号没有图床访问权限，仅限软件工程学院内部账号使用")
+	// ErrInvalidSSO 共享会话不存在 / 已撤销 / 已过期。
+	ErrInvalidSSO = errors.New("invalid_sso")
+	// ErrSSOUnavailable UniSSO 限流、故障或网络异常（静默回落表单，不踢本地会话）。
+	ErrSSOUnavailable = errors.New("sso_unavailable")
+)
 
-const passwordVerifyPath = "/api/oauth/password/verify"
+const (
+	passwordVerifyPath = "/api/oauth/password/verify"
+	sessionVerifyPath  = "/api/oauth/session/verify"
+	sessionRevokePath  = "/api/oauth/session/revoke"
+
+	// SSOCookieName 共享 SSO Cookie 的新名称；unisso 以 password/verify 响应里的
+	// sso_cookie_name 为真源，这里只是响应缺省时的兜底。
+	SSOCookieName = "unisso_sid"
+	// SSOCookieLegacyName 旧版共享 Cookie 名（unisso 切换默认名前已签发的存量），
+	// 兼容期双读双清。
+	SSOCookieLegacyName = "sse_sso"
+
+	fallbackSSOCookieDomain = ".ssemarket.cn"
+	fallbackSSOMaxAge       = 604800
+)
+
+// SSOCookie UniSSO 签发的共享会话 Cookie 元数据（由登录平台种到父域供全平台静默兑换）。
+type SSOCookie struct {
+	Session string
+	Name    string
+	Domain  string
+	MaxAge  int
+}
 
 // UnissoService 通过 UniSSO 机器对机器密码校验端点完成邮箱+密码登录（无 OAuth 跳转）：
 // POST {issuer}/api/oauth/password/verify（form：email/password/client_id/client_secret），
-// 成功 200 {"ok":true,"user":{sub,sso_sub,sse_sub,internal,...}}；按 sub upsert 本地用户。
+// 成功 200 {"ok":true,"user":{sub,sso_sub,sse_sub,internal,...},sso_session,sso_cookie_name,...}；
+// 按 sub upsert 本地用户。响应里的共享会话元数据用于在同一响应中种父域 Cookie。
 type UnissoService struct {
 	cfg   *config.Config
 	users *repository.UserRepo
@@ -31,7 +61,7 @@ type UnissoService struct {
 	http  *http.Client
 }
 
-// UnissoUser UniSSO password/verify 返回的用户资料。
+// UnissoUser UniSSO 返回的用户资料。
 type UnissoUser struct {
 	Sub               string   `json:"sub"`
 	SsoSub            string   `json:"sso_sub"`
@@ -82,7 +112,8 @@ func (s *UnissoService) IsConfigured() bool {
 }
 
 // Verify 调 UniSSO 密码校验端点；只做一次调用，429 不自动重试。
-func (s *UnissoService) Verify(email, password string) (*UnissoUser, error) {
+// 成功时同时返回共享会话 Cookie 元数据（可能为 nil，视 unisso 响应而定）。
+func (s *UnissoService) Verify(email, password string) (*UnissoUser, *SSOCookie, error) {
 	form := url.Values{}
 	form.Set("email", strings.ToLower(strings.TrimSpace(email)))
 	form.Set("password", password)
@@ -92,16 +123,16 @@ func (s *UnissoService) Verify(email, password string) (*UnissoUser, error) {
 	resp, body, err := s.doRequest(http.MethodPost, s.cfg.OAuthIssuer()+passwordVerifyPath,
 		strings.NewReader(form.Encode()), "application/x-www-form-urlencoded")
 	if err != nil {
-		return nil, errors.New("无法连接登录服务，请稍后再试")
+		return nil, nil, errors.New("无法连接登录服务，请稍后再试")
 	}
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// unisso 侧按 IP+email 锁 15 分钟，自动重试只会更糟
-		return nil, errors.New("尝试次数过多，请 15 分钟后再试")
+		return nil, nil, errors.New("尝试次数过多，请 15 分钟后再试")
 	case resp.StatusCode == http.StatusBadRequest:
-		return nil, errors.New("请填写邮箱和密码")
+		return nil, nil, errors.New("请填写邮箱和密码")
 	case resp.StatusCode == http.StatusForbidden:
-		return nil, errors.New("登录服务拒绝本应用，请检查客户端配置")
+		return nil, nil, errors.New("登录服务拒绝本应用，请检查客户端配置")
 	case resp.StatusCode == http.StatusUnauthorized:
 		var e struct {
 			Error string `json:"error"`
@@ -109,30 +140,98 @@ func (s *UnissoService) Verify(email, password string) (*UnissoUser, error) {
 		if json.Unmarshal(body, &e) == nil {
 			switch e.Error {
 			case "invalid_credentials":
-				return nil, errors.New("邮箱或密码错误")
+				return nil, nil, errors.New("邮箱或密码错误")
 			case "invalid_client":
-				return nil, errors.New("登录服务配置错误，请联系管理员")
+				return nil, nil, errors.New("登录服务配置错误，请联系管理员")
 			}
 		}
-		return nil, errors.New("登录失败，请稍后再试")
+		return nil, nil, errors.New("登录失败，请稍后再试")
 	case resp.StatusCode < 200 || resp.StatusCode >= 300:
-		return nil, errors.New("登录失败，请稍后再试")
+		return nil, nil, errors.New("登录失败，请稍后再试")
+	}
+
+	var out struct {
+		OK              bool       `json:"ok"`
+		User            UnissoUser `json:"user"`
+		SSOSession      string     `json:"sso_session"`
+		SSOCookieName   string     `json:"sso_cookie_name"`
+		SSOCookieDomain string     `json:"sso_cookie_domain"`
+		SSOMaxAge       int        `json:"sso_max_age"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, nil, errors.New("登录服务返回异常")
+	}
+	if !out.OK || out.User.Sub == "" {
+		return nil, nil, errors.New("登录服务返回异常")
+	}
+	if !bool(out.User.Internal) {
+		return nil, nil, ErrNotInternal
+	}
+	var sso *SSOCookie
+	if out.SSOSession != "" {
+		sso = &SSOCookie{
+			Session: out.SSOSession,
+			Name:    out.SSOCookieName,
+			Domain:  out.SSOCookieDomain,
+			MaxAge:  out.SSOMaxAge,
+		}
+		if sso.Name == "" {
+			sso.Name = SSOCookieName
+		}
+		if sso.Domain == "" {
+			sso.Domain = fallbackSSOCookieDomain
+		}
+		if sso.MaxAge <= 0 {
+			sso.MaxAge = fallbackSSOMaxAge
+		}
+	}
+	return &out.User, sso, nil
+}
+
+// VerifySession 用共享 SSO Cookie 的值向 UniSSO 校验会话并取用户（静默 SSO）。
+// 400/401 → ErrInvalidSSO；其余非 2xx、结构异常、网络故障 → ErrSSOUnavailable；
+// 非 internal → ErrNotInternal。
+func (s *UnissoService) VerifySession(session string) (*UnissoUser, error) {
+	form := url.Values{}
+	form.Set("session", session)
+	form.Set("client_id", s.cfg.OAuth.ClientID)
+	form.Set("client_secret", s.cfg.OAuth.ClientSecret)
+
+	resp, body, err := s.doRequest(http.MethodPost, s.cfg.OAuthIssuer()+sessionVerifyPath,
+		strings.NewReader(form.Encode()), "application/x-www-form-urlencoded")
+	if err != nil {
+		return nil, ErrSSOUnavailable
+	}
+	switch {
+	case resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized:
+		return nil, ErrInvalidSSO
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		return nil, ErrSSOUnavailable
 	}
 
 	var out struct {
 		OK   bool       `json:"ok"`
 		User UnissoUser `json:"user"`
 	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, errors.New("登录服务返回异常")
-	}
-	if !out.OK || out.User.Sub == "" {
-		return nil, errors.New("登录服务返回异常")
+	if err := json.Unmarshal(body, &out); err != nil || !out.OK || out.User.Sub == "" {
+		return nil, ErrSSOUnavailable
 	}
 	if !bool(out.User.Internal) {
 		return nil, ErrNotInternal
 	}
 	return &out.User, nil
+}
+
+// RevokeSession 撤销共享会话（登出用，尽力而为：失败只记日志，不阻塞本地登出）。
+func (s *UnissoService) RevokeSession(session string) {
+	form := url.Values{}
+	form.Set("session", session)
+	form.Set("client_id", s.cfg.OAuth.ClientID)
+	form.Set("client_secret", s.cfg.OAuth.ClientSecret)
+	if _, _, err := s.doRequest(http.MethodPost, s.cfg.OAuthIssuer()+sessionRevokePath,
+		strings.NewReader(form.Encode()), "application/x-www-form-urlencoded"); err != nil {
+		log.Printf("unisso session/revoke 失败（忽略）：%v", err)
+	}
 }
 
 // UpsertUser 按 UniSSO sub 创建或更新本地用户并返回。

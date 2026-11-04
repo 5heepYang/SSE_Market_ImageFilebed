@@ -45,12 +45,16 @@ func SetupRouter(cfg *config.Config, db *gorm.DB, store blob.Store) *gin.Engine 
 	go tokenLimiter.cleanupLoop()
 	loginLimiter := newKeyedRateLimiter(1, 5)
 	go loginLimiter.cleanupLoop()
+	ssoLimiter := newKeyedRateLimiter(1.0/6.0, 10) // 静默 SSO：约 10 次/分/IP
+	go ssoLimiter.cleanupLoop()
 
 	api := r.Group("/api")
 	{
 		auth := api.Group("/auth")
 		{
 			auth.POST("/login", rateLimitMiddleware(loginLimiter), authCtrl.Login)
+			auth.POST("/sso/try", rateLimitMiddleware(ssoLimiter), authCtrl.SSOTry)
+			auth.POST("/logout", authCtrl.Logout)
 			auth.GET("/me", middleware.JWTAuth(authSvc), authCtrl.Me)
 		}
 
