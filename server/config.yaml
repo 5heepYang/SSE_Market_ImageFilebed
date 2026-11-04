@@ -1,0 +1,37 @@
+server:
+  port: "8080"
+  mode: "debug"              # gin 模式：debug / release / test
+  public_base_url: "https://image.ssemarket.cn"  # 生产子域名；本地可清空或改 localhost
+  frontend_dist: "../web/dist"  # 前端构建产物目录，存在时由后端直接托管（SPA）
+  allowed_origins:
+    - "https://ssemarket.cn"
+    - "https://image.ssemarket.cn"
+
+database:
+  path: "data/imagebed.db"
+
+jwt:
+  secret: \"CHANGE_ME_IN_PRODUCTION\"
+  expire_hours: 168          # Web 登录态有效期（小时），7 天
+
+upload:
+  max_size_mb: 20            # 单文件最大体积
+  thumb_max_edge: 400        # 缩略图最长边（像素）
+
+resumable:
+  enabled: true              # 是否启用断点续传/分片上传
+  max_size_mb: 150           # 单文件总大小上限
+  max_chunk_mb: 2            # 单个分片请求体上限（客户端建议 1MB）
+  chunks_dir: ""             # 临时分片目录；留空则为 data/chunks
+  max_concurrent: 30         # 单账户同时上传中的会话上限；服务账号（模块接入）可调大
+  admission_per_second: 5    # 准入令牌桶：每秒允许新建的上传任务数
+  admission_burst: 20       # 准入令牌桶：瞬时突发容量
+  global_max_concurrent: 100 # 全平台（所有模块之和）在传总数上限，保护共享物理层；负值 = 不限制
+
+storage:
+  data_dir: "data"           # 数据根目录（图片 + 缩略图 + 文档对象 + SQLite 均在其下）
+
+oauth:                       # UniSSO 邮箱+密码登录（机器对机器校验，无 OAuth 跳转）
+  issuer: "https://sso.ssemarket.cn"
+  client_id: ""              # 由环境变量 UNISSO_CLIENT_ID 注入
+  client_secret: \"REPLACE_WITH_YOUR_UNISSO_CLIENT_SECRET\"

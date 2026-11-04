@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# imagebed → sseinfra / SDPY 压缩包入口（仓根可执行）
+# 主入口：https://image.ssemarket.cn （子域名）；路径 /sdpy/image/ 仍可作备用
+# 要求：前台常驻，监听 0.0.0.0:$PORT（默认 8080）
+set -euo pipefail
+
+PORT="${PORT:-8080}"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+DATA="${SDPY_DATA_DIR:-${DATA_DIR:-$ROOT/data}}"
+mkdir -p "$DATA/images" "$DATA/thumbs" "$DATA/objects" "$DATA/chunks"
+export DATA_DIR="$DATA"
+export DB_PATH="${DB_PATH:-$DATA/imagebed.db}"
+export PORT
+export SERVER_MODE="${SERVER_MODE:-release}"
+
+PUBLIC_URL="${SDPY_PUBLIC_URL:-}"
+# 去掉末尾 /
+PUBLIC_URL="${PUBLIC_URL%/}"
+
+# 子域名模式：https://image.ssemarket.cn （路径仅 / 或空）
+is_subdomain_root() {
+  local u="$1"
+  [ -n "$u" ] || return 1
+  # 有 host，且 path 为空或 /
+  echo "$u" | grep -qE '^https?://[^/]+$' && return 0
+  echo "$u" | grep -qE '^https?://[^/]+/$' && return 0
+  return 1
+}
+
+if is_subdomain_root "$PUBLIC_URL"; then
+  BASE_PATH="/"
+  # 同源：前端与 API 同域，Axios 用相对路径
+  API_BASE=""
+  export PUBLIC_BASE="${PUBLIC_BASE:-$PUBLIC_URL}"
+  export PATH_PREFIX=""
+  echo "[deploy] 子域名模式 PUBLIC_URL=$PUBLIC_URL → VITE_BASE_PATH=/ 同源 API"
+elif [ -n "${SDPY_PUBLIC_BASE:-}" ]; then
+  BASE_PATH="${SDPY_PUBLIC_BASE}"
+  case "$BASE_PATH" in
+    */) ;;
+    *) BASE_PATH="${BASE_PATH}/" ;;
+  esac
+  # 路径模式前端和 API 同源，统一使用前端挂载前缀。
+  # 若 SDPY_PUBLIC_URL 只是主站根地址，跨到根 /api 会打到别的服务，导致文件预览失败。
+  API_BASE="${BASE_PATH}"
+  if [ -z "${PUBLIC_BASE:-}" ]; then
+    if [ -n "${SDPY_API_PUBLIC_URL:-}" ]; then
+      export PUBLIC_BASE="$SDPY_API_PUBLIC_URL"
+    elif [ -n "$PUBLIC_URL" ]; then
+      export PUBLIC_BASE="$PUBLIC_URL"
+    fi
+  fi
+  export PATH_PREFIX="${SDPY_PUBLIC_BASE:-}"
+  echo "[deploy] 路径模式 BASE_PATH=$BASE_PATH API_BASE=$API_BASE"
+else
+  # 打包默认 / 预构建；运行时若无 SDPY_* 则按子域名约定
+  BASE_PATH="/"
+  API_BASE=""
+  export PUBLIC_BASE="${PUBLIC_BASE:-https://image.ssemarket.cn}"
+  export PATH_PREFIX=""
+  echo "[deploy] 默认子域名约定 PUBLIC_BASE=$PUBLIC_BASE"
+fi
+
+# UniSSO 客户端凭证由 supervisor 环境变量注入（UNISSO_CLIENT_ID / UNISSO_CLIENT_SECRET / UNISSO_ISSUER），
+# 此处不再做任何 OAuth 变量兼容。
+
+echo "[deploy] imagebed PORT=$PORT bind=0.0.0.0 DATA_DIR=$DATA_DIR"
+echo "[deploy] PUBLIC_BASE=${PUBLIC_BASE:-} BASE_PATH=$BASE_PATH API_BASE=${API_BASE:-<same-origin>}"
+
+build_web() {
+  local web_dir="$ROOT/web"
+  [ -f "$web_dir/package.json" ] || return 0
+  command -v node >/dev/null 2>&1 || {
+    echo "[deploy] 需要 node 以构建前端" >&2
+    exit 1
+  }
+  echo "[deploy] 使用 Node $(node -v)；构建前端 VITE_BASE_PATH=$BASE_PATH …"
+  (
+    cd "$web_dir"
+    if [ -f package-lock.json ]; then
+      npm ci || npm install
+    else
+      npm install
+    fi
+    VITE_BASE_PATH="$BASE_PATH" VITE_API_BASE="$API_BASE" npm run build
+  )
+}
+
+NEED_WEB=0
+MARK_KEY="${BASE_PATH}|${API_BASE}|subdomain-v1"
+if [ "${FORCE_REBUILD_WEB:-0}" = "1" ]; then
+  NEED_WEB=1
+elif [ ! -d "$ROOT/web/dist" ] || [ ! -f "$ROOT/web/dist/index.html" ]; then
+  NEED_WEB=1
+else
+  MARK="$ROOT/web/dist/.sdpy_base"
+  if [ ! -f "$MARK" ] || [ "$(cat "$MARK" 2>/dev/null | tr -d '\r\n')" != "$MARK_KEY" ]; then
+    NEED_WEB=1
+  fi
+fi
+
+if [ "$NEED_WEB" = "1" ]; then
+  build_web
+  echo "$MARK_KEY" > "$ROOT/web/dist/.sdpy_base"
+fi
+
+if [ ! -f "$ROOT/web/dist/index.html" ]; then
+  echo "[deploy] 缺少 web/dist/index.html" >&2
+  exit 1
+fi
+echo "[deploy] frontend index=$(head -c 200 "$ROOT/web/dist/index.html" | tr '\n' ' ')"
+
+BIN=""
+if [ -f "$ROOT/bin/imagebed" ]; then
+  chmod +x "$ROOT/bin/imagebed" 2>/dev/null || true
+  BIN="$ROOT/bin/imagebed"
+elif [ -f "$ROOT/imagebed" ]; then
+  chmod +x "$ROOT/imagebed" 2>/dev/null || true
+  BIN="$ROOT/imagebed"
+fi
+
+if [ -z "$BIN" ]; then
+  if ! command -v go >/dev/null 2>&1; then
+    echo "[deploy] 下载 Go 工具链…"
+    GO_VER="${GO_VERSION:-1.25.8}"
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+      x86_64|amd64) GO_ARCH=amd64 ;;
+      aarch64|arm64) GO_ARCH=arm64 ;;
+      *) echo "[deploy] 不支持的架构: $ARCH" >&2; exit 1 ;;
+    esac
+    TMP="$(mktemp -d)"
+    curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-${GO_ARCH}.tar.gz" -o "$TMP/go.tgz"
+    mkdir -p "$ROOT/.tools"
+    rm -rf "$ROOT/.tools/go"
+    tar -C "$ROOT/.tools" -xzf "$TMP/go.tgz"
+    rm -rf "$TMP"
+    export PATH="$ROOT/.tools/go/bin:$PATH"
+  fi
+  echo "[deploy] go build → bin/imagebed"
+  mkdir -p "$ROOT/bin"
+  (
+    cd "$ROOT/server"
+    export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+    CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o "$ROOT/bin/imagebed" .
+  )
+  BIN="$ROOT/bin/imagebed"
+fi
+
+export FRONTEND_DIST="${FRONTEND_DIST:-$ROOT/web/dist}"
+if [ ! -f "$ROOT/config.yaml" ] && [ -f "$ROOT/server/config.yaml" ]; then
+  cp -f "$ROOT/server/config.yaml" "$ROOT/config.yaml"
+fi
+
+echo "[deploy] 启动 $BIN → 0.0.0.0:${PORT} frontend=$FRONTEND_DIST path_prefix=${PATH_PREFIX:-/}"
+cd "$ROOT"
+exec "$BIN"

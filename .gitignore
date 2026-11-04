@@ -1,0 +1,26 @@
+# Go
+server/data/
+server/imagebed
+server/imagebed.exe
+server/*.exe
+
+# Node
+web/node_modules/
+web/dist/
+
+# misc
+*.log
+.DS_Store
+
+# 部署产物（由 deploy/pack.ps1 生成）
+imagebed-deploy.zip
+
+# 运行时密钥与产物
+.env
+.env.*
+logs/
+bin/
+*.bak*
+__pycache__/
+.DS_Store
+._*
