@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -61,6 +62,15 @@ func serveImage(c *gin.Context, store blob.Store, imageSvc *service.ImageService
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
+		// 惰性对象探测：MinIO 的 Get 在对象缺失时要到首次读取才报错，
+		// 不探测会输出 200 空响应；缺失/不可读一律按 404 处理。
+		probed, ok := peekNonEmpty(rc)
+		if !ok {
+			rc.Close()
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+		rc = probed
 	}
 	defer rc.Close()
 
@@ -106,7 +116,12 @@ func openResized(c *gin.Context, store blob.Store, originalRel, mimeType string,
 	defer lock.Unlock()
 
 	if rc, err := store.Get(c.Request.Context(), variantRel); err == nil {
-		return rc, resizeContentType(params.format), variantRel
+		// 同上：缓存对象可能不存在（首次请求）或为空（历史脏数据），
+		// 预读探测确认真实可读，未命中则走生成路径并覆盖旧缓存。
+		if probed, ok := peekNonEmpty(rc); ok {
+			return probed, resizeContentType(params.format), variantRel
+		}
+		rc.Close()
 	}
 
 	rc, err := store.Get(c.Request.Context(), originalRel)
@@ -134,6 +149,23 @@ func openResized(c *gin.Context, store blob.Store, originalRel, mimeType string,
 		return io.NopCloser(bytes.NewReader(out)), contentType, originalRel
 	}
 	return io.NopCloser(bytes.NewReader(out)), contentType, variantRel
+}
+
+// peekNonEmpty 预读 1 字节探测惰性存储对象是否真实存在且非空。
+// minio-go 的 GetObject 不发请求即返回，key 不存在要到首次 Read 才报错；
+// 若不探测，缓存未命中会被误判为命中，输出 200 空 body。
+// 返回的 reader 自带预读缓冲可直接作响应体；ok=false 时调用方需关闭原 rc。
+func peekNonEmpty(rc io.ReadCloser) (io.ReadCloser, bool) {
+	br := bufio.NewReader(rc)
+	if _, err := br.Peek(1); err != nil {
+		return nil, false
+	}
+	return probedReadCloser{Reader: br, Closer: rc}, true
+}
+
+type probedReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 var resizeLocks sync.Map
