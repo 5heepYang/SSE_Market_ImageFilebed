@@ -1,0 +1,2 @@
+# SSE_Market_ImageFilebed
+一个为软工集市提供图片和文档存储，以及调用对象存储的平台
