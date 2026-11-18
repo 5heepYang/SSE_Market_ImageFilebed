@@ -22,7 +22,9 @@
     .then(function(r){if(r.status===401)return{__s:401};return r.ok?r.json():{__s:503}})
     .catch(function(){return{__s:503}});
   var fast=false;
-  Promise.race([p,wait(4000)]).then(function(d){
+  /* 本地已有 token 的回访用户：应用启动即为登录态，等 SSO 毫无意义，
+     超时设 0 立即启动（白屏消失）；无 token 才等 4s（2026-11-18） */
+  Promise.race([p,wait(localStorage.getItem("imagebed_token")?0:4000)]).then(function(d){
     if(d){fast=true;
       if(d.__s===401){clearLocal();go()}
       else if(d.__s===503){go()}
@@ -31,8 +33,12 @@
   });
   p.then(function(d){
     if(fast||!d)return;
-    if(d.__s===401){var had=!!(localStorage.getItem("imagebed_token")||"");clearLocal();if(had)location.reload()}
-    else if(d.__s!==503){apply(d);if(!typing())location.reload()}
+    var had=!!(localStorage.getItem("imagebed_token")||"");
+    if(d.__s===401){clearLocal();if(had)location.reload()}
+    /* 晚到成功：仅本地原无 token（匿名启动）时才需 reload 变为登录态；
+       回访用户已有有效 token，静默轮换即可——无条件 reload 在慢链路上
+      会造成「超时启动→晚到→刷新」每次访问连闪多帧（2026-11-18 修复） */
+    else if(d.__s!==503){apply(d);if(!had&&!typing())location.reload()}
   }).catch(function(){});
 })();
 </script>
