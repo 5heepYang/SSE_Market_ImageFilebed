@@ -8,6 +8,21 @@ PORT="${PORT:-8080}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# 可选本地环境文件：存放不便入库的配置（UNISSO_* 密钥、SDPY_PUBLIC_URL 等）。
+# 文件位于部署根目录、已被 .gitignore 忽略；此处只补充「尚未设置」的变量，
+# 平台注入的环境变量优先级更高，不会被覆盖。
+if [ -f "$ROOT/.env.local" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue ;; esac
+    key="${line%%=*}"
+    [ -n "$key" ] || continue
+    if [ -z "${!key:-}" ]; then
+      export "${line}"
+    fi
+  done < "$ROOT/.env.local"
+  echo "[deploy] 已加载 .env.local（补充缺失变量）"
+fi
+
 # 部署平台会向进程注入需要认证的 HTTP(S)_PROXY（实测返回 407），
 # 构建阶段的包下载（npm ci / Go 工具链）会因此失败。
 # 本集群实测可直连 go 镜像、npm registry 与 GitHub，构建期清除代理即可。
