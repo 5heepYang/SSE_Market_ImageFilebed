@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { isLoggedIn, isOAuthPending } from '../store/auth'
+import { isLoggedIn } from '../store/auth'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -8,11 +8,6 @@ const router = createRouter({
       path: '/login',
       name: 'login',
       component: () => import('../views/LoginView.vue'),
-    },
-    {
-      path: '/oauth/callback',
-      name: 'oauth-callback',
-      component: () => import('../views/OAuthCallbackView.vue'),
     },
     {
       path: '/',
@@ -35,19 +30,13 @@ const router = createRouter({
   ],
 })
 
+// 登录态由 main.ts 的启动引导决定（静默 SSO / 本地 token），
+// 因此这里只需做最基础的路由守卫，不再有 OAuth 回调与 pending 状态。
 router.beforeEach((to) => {
-  // 任意路由携带 code+state 时统一转到回调页（防止 redirect_uri 配到根路径时丢失）
-  if (to.query.code && to.query.state && to.name !== 'oauth-callback') {
-    return { name: 'oauth-callback', query: { code: to.query.code, state: to.query.state } }
-  }
-  // 回调处理期间不抢跑跳登录
-  if (isOAuthPending()) return true
-  if (to.meta.requiresAuth && !isLoggedIn()) {
+  if (to.meta.requiresAuth && !isLoggedIn())
     return { name: 'login', query: { redirect: to.fullPath } }
-  }
-  if (to.name === 'login' && isLoggedIn()) {
+  if (to.name === 'login' && isLoggedIn())
     return { name: 'images' }
-  }
 })
 
 export default router

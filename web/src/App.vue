@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { logout as apiLogout } from './api/auth'
 import { auth, clearAuth } from './store/auth'
 import Toast from './components/Toast.vue'
 
@@ -11,7 +12,13 @@ const logoUrl =
   'https://image.ssemarket.cn/i/images/2026/08/24/694837ed-65b6-400a-86f1-0b5886b2fb78.png'
 const showNav = computed(() => route.name !== 'login')
 
-function logout() {
+// 单点登出：先通知后端撤销 UniSSO 共享会话并清父域 Cookie，再清本地 JWT。
+// 后端失败不阻塞本地登出（本地 JWT 无服务端状态，删掉即失效）。
+async function logout() {
+  try {
+    await apiLogout()
+  }
+  catch { /* 忽略：网络或会话已失效 */ }
   clearAuth()
   router.push('/login')
 }

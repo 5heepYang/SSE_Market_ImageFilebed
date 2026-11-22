@@ -2,7 +2,7 @@ import axios, { type AxiosInstance } from 'axios'
 import { auth, clearAuth } from '../store/auth'
 
 /** 子域名同源时 VITE_API_BASE 为空；路径部署时为完整后端公网地址 */
-function resolveBase(): string {
+export function apiBase(): string {
   const api = (import.meta.env.VITE_API_BASE || '').trim()
   if (api) return api.replace(/\/?$/, '/')
   // 同源模式下必须跟随前端部署前缀：
@@ -12,7 +12,7 @@ function resolveBase(): string {
 }
 
 const instance: AxiosInstance = axios.create({
-  baseURL: resolveBase(),
+  baseURL: apiBase(),
   timeout: 60000,
 })
 
