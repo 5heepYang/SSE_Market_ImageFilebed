@@ -8,6 +8,11 @@ PORT="${PORT:-8080}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# 部署平台会向进程注入需要认证的 HTTP(S)_PROXY（实测返回 407），
+# 构建阶段的包下载（npm ci / Go 工具链）会因此失败。
+# 本集群实测可直连 go 镜像、npm registry 与 GitHub，构建期清除代理即可。
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy 2>/dev/null || true
+
 DATA="${SDPY_DATA_DIR:-${DATA_DIR:-$ROOT/data}}"
 mkdir -p "$DATA/images" "$DATA/thumbs" "$DATA/objects" "$DATA/chunks"
 export DATA_DIR="$DATA"
