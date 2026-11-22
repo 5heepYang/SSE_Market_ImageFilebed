@@ -32,12 +32,29 @@ async function bootstrapAuth(): Promise<void> {
     return
   }
 
+  const ssoPromise = trySilentSSO()
   const raced = await Promise.race([
-    trySilentSSO(),
+    ssoPromise,
     new Promise<null>(resolve => setTimeout(() => resolve(null), SSO_WAIT_MS)),
   ])
-  if (raced?.token)
+
+  if (raced?.token) {
     setAuth(raced.token, raced.user)
+    return
+  }
+
+  // 超时先放行渲染；SSO 结果晚到且命中时，热更新登录态并跳回原目标，
+  // 无需整页刷新（慢链路下 SSO 常见超过 4 秒，旧版在此处会 reload 闪一下）。
+  ssoPromise.then((late) => {
+    if (!late?.token)
+      return
+    setAuth(late.token, late.user)
+    const current = router.currentRoute.value
+    if (current.name === 'login') {
+      const target = (current.query.redirect as string) || '/'
+      router.replace(target).catch(() => { /* 路由跳转失败不阻塞 */ })
+    }
+  }).catch(() => { /* 静默失败 */ })
 }
 
 bootstrapAuth().finally(() => {
