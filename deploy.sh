@@ -132,7 +132,24 @@ if [ -z "$BIN" ]; then
       *) echo "[deploy] 不支持的架构: $ARCH" >&2; exit 1 ;;
     esac
     TMP="$(mktemp -d)"
-    curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-${GO_ARCH}.tar.gz" -o "$TMP/go.tgz"
+    # go.dev 在部分集群网络不可达（实测 WZ8 测试 pod 超时），按顺序回退到
+    # 可达镜像：阿里云镜像 / golang.google.cn。可用 GO_DOWNLOAD_BASE 覆盖首选源。
+    TGZ="go${GO_VER}.linux-${GO_ARCH}.tar.gz"
+    GOT=0
+    for BASE in "${GO_DOWNLOAD_BASE:-https://go.dev/dl}" \
+                "https://mirrors.aliyun.com/golang" \
+                "https://golang.google.cn/dl"; do
+      echo "[deploy] 尝试下载 $BASE/$TGZ"
+      if curl -fsSL -L --connect-timeout 10 --max-time 300 "$BASE/$TGZ" -o "$TMP/go.tgz"; then
+        GOT=1
+        break
+      fi
+      echo "[deploy] 该源不可用，换下一个"
+    done
+    if [ "$GOT" != "1" ]; then
+      echo "[deploy] Go 工具链下载失败（所有源均不可用），可用 GO_VERSION/GO_DOWNLOAD_BASE 指定" >&2
+      exit 1
+    fi
     mkdir -p "$ROOT/.tools"
     rm -rf "$ROOT/.tools/go"
     tar -C "$ROOT/.tools" -xzf "$TMP/go.tgz"
