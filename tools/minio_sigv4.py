@@ -85,9 +85,15 @@ def s3_list_prefix(prefix, timeout=60):
     import re
     out, token = [], None
     while True:
-        q = 'list-type=2&prefix=' + urllib.parse.quote(prefix) + '&max-keys=1000'
+        # SigV4 规范查询串要求：参数按 key 字典序排列，且按 RFC3986 全量编码
+        # （'/' 必须写成 %2F）。顺序或编码任一不符都会 403。
+        params = {'list-type': '2', 'max-keys': '1000', 'prefix': prefix}
         if token:
-            q += '&continuation-token=' + urllib.parse.quote(token)
+            params['continuation-token'] = token
+        q = '&'.join(
+            '%s=%s' % (k, urllib.parse.quote(v, safe=''))
+            for k, v in sorted(params.items())
+        )
         with _request('GET', '', query=q, timeout=timeout) as resp:
             body = resp.read().decode('utf-8', 'replace')
         keys = re.findall(r'<Key>[^<]+</Key>', body)
