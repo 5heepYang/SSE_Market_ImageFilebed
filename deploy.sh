@@ -32,6 +32,26 @@ DATA="${SDPY_DATA_DIR:-${DATA_DIR:-$ROOT/data}}"
 mkdir -p "$DATA/images" "$DATA/thumbs" "$DATA/objects" "$DATA/chunks"
 export DATA_DIR="$DATA"
 export DB_PATH="${DB_PATH:-$DATA/imagebed.db}"
+
+# 数据库内存化：本平台 pod 的 /home/cloud 是 NFS，存储卡顿时每次查询都会阻塞
+# （实测单请求 16 秒）。DB 只有几 MB，放到 /dev/shm（pod 内存）后读写为微秒级；
+# 持久化由 tools/db_persist.py 定时把快照传回 MinIO，pod 重启时再从 MinIO 拉回。
+# 仅当 MinIO 已配置时启用；任何一步失败都回退到 NFS，保证服务一定起得来。
+if [ -n "${MINIO_ENDPOINT:-}" ] && [ -n "${MINIO_BUCKET:-}" ] && [ -d /dev/shm ] \
+   && { [ -n "${MINIO_ACCESS_KEY:-}" ] || [ -n "${MINIO_ACCESS_KEY_ID:-}" ]; }; then
+  SHM_DB="$(python3 "$ROOT/tools/db_bootstrap.py" "$ROOT" 2>>"${LOG_DIR:-$ROOT/logs}/db-persist.log" | tail -1 || true)"
+  if [ "$SHM_DB" = "/dev/shm/imagebed.db" ] && [ -f "$SHM_DB" ]; then
+    export DB_PATH="$SHM_DB"
+    echo "[deploy] 数据库已载入内存盘: $DB_PATH"
+    mkdir -p "${LOG_DIR:-$ROOT/logs}"
+    setsid nohup python3 "$ROOT/tools/db_persist.py" \
+      >> "${LOG_DIR:-$ROOT/logs}/db-persist.log" 2>&1 &
+    echo "[deploy] 已启动 DB 持久化循环"
+  else
+    echo "[deploy] 内存盘不可用，数据库回退 NFS: $DB_PATH"
+  fi
+fi
+
 export PORT
 export SERVER_MODE="${SERVER_MODE:-release}"
 
