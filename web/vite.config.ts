@@ -15,6 +15,8 @@ export default defineConfig({
     proxy: {
       '/api': { target: 'http://localhost:8080', changeOrigin: true },
       '/i': { target: 'http://localhost:8080', changeOrigin: true },
+      // 文档/附件直链（README「文件直链」一节），本地开发时同样需要转发
+      '/o': { target: 'http://localhost:8080', changeOrigin: true },
     },
   },
 })
